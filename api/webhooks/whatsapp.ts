@@ -1,21 +1,46 @@
-import type { IncomingMessage, ServerResponse } from 'http';
-import { parse as parseUrl } from 'url';
 import crypto from 'crypto';
 
 /**
- * Vercel Serverless Function Configuration
- * Disable automatic bodyParser so we can capture the pristine raw request stream
- * required for cryptographic HMAC SHA-256 verification (X-Hub-Signature-256).
+ * Deduplication cache with bounded memory eviction (5,000 entries)
  */
-export const config = {
-  api: {
-    bodyParser: false,
-  },
-};
-
-// Deduplication cache with bounded memory eviction (5,000 entries)
 const processedMessageIds = new Set<string>();
 const MAX_CACHE_SIZE = 5000;
+
+export interface SecretDiagnostics {
+  configured: boolean;
+  rawLength: number;
+  trimmedLength: number;
+  hasWrappingQuotes: boolean;
+  hasWhitespace: boolean;
+}
+
+/**
+ * Safely inspects secret metadata without ever logging or exposing the secret value.
+ */
+export function inspectSecret(envVarName: string): SecretDiagnostics {
+  const raw = process.env[envVarName];
+  if (!raw) {
+    return {
+      configured: false,
+      rawLength: 0,
+      trimmedLength: 0,
+      hasWrappingQuotes: false,
+      hasWhitespace: false,
+    };
+  }
+  const hasWhitespace = /^\s|\s$/.test(raw);
+  const trimmed = raw.trim();
+  const hasWrappingQuotes = /^["'].*["']$/.test(trimmed);
+  const unquoted = trimmed.replace(/^["']|["']$/g, '').trim();
+
+  return {
+    configured: true,
+    rawLength: raw.length,
+    trimmedLength: unquoted.length,
+    hasWrappingQuotes,
+    hasWhitespace,
+  };
+}
 
 function maskPhoneNumber(phone: string): string {
   if (!phone || phone.length < 6) return '***';
@@ -27,8 +52,8 @@ function maskPhoneNumber(phone: string): string {
  */
 export function verifyHubSignature(
   rawBuffer: Buffer,
-  signatureHeader: string | undefined
-): { valid: boolean; reason?: string } {
+  signatureHeader: string | null | undefined
+): { valid: boolean; reason?: string; computedDigestLength?: number; expectedPrefixMatch?: boolean } {
   // Strip optional wrapping quotes (e.g. if set in Vercel as "secret" or 'secret') and whitespace
   const appSecret = process.env.META_WA_APP_SECRET?.replace(/^["']|["']$/g, '').trim();
 
@@ -52,14 +77,15 @@ export function verifyHubSignature(
 
   // 3. Malformed signature header (must start with sha256=)
   const trimmedHeader = signatureHeader.trim();
-  if (!trimmedHeader.toLowerCase().startsWith('sha256=')) {
-    return { valid: false, reason: 'Malformed signature header (expected sha256=<hash>)' };
+  const lowerHeader = trimmedHeader.toLowerCase();
+  if (!lowerHeader.startsWith('sha256=')) {
+    return { valid: false, reason: 'Malformed signature header (expected sha256=<hash>)', expectedPrefixMatch: false };
   }
 
   // 4. Validate hex digest length (SHA-256 hex digest is exactly 64 hexadecimal characters)
   const signatureHex = trimmedHeader.slice(7).trim();
   if (!signatureHex || !/^[0-9a-fA-F]{64}$/.test(signatureHex)) {
-    return { valid: false, reason: 'Malformed signature header (expected 64-char hex digest)' };
+    return { valid: false, reason: 'Malformed signature header (expected 64-char hex digest)', expectedPrefixMatch: true };
   }
 
   try {
@@ -73,13 +99,20 @@ export function verifyHubSignature(
     const actualBuffer = Buffer.from(signatureHex.toLowerCase(), 'utf8');
 
     if (expectedBuffer.length !== actualBuffer.length) {
-      return { valid: false, reason: 'Signature length mismatch' };
+      return {
+        valid: false,
+        reason: 'Signature length mismatch',
+        computedDigestLength: expectedBuffer.length,
+        expectedPrefixMatch: true,
+      };
     }
 
     const matches = crypto.timingSafeEqual(expectedBuffer, actualBuffer);
     return {
       valid: matches,
       reason: matches ? undefined : 'Cryptographic signature mismatch',
+      computedDigestLength: expectedBuffer.length,
+      expectedPrefixMatch: true,
     };
   } catch (err: any) {
     return { valid: false, reason: `Verification error: ${err.message}` };
@@ -91,9 +124,9 @@ export function verifyHubSignature(
  * Runs instantaneously with zero database or MongoDB overhead.
  */
 export function handleWebhookVerification(
-  mode: string | undefined,
-  token: string | undefined,
-  challenge: string | undefined
+  mode: string | null | undefined,
+  token: string | null | undefined,
+  challenge: string | null | undefined
 ): { status: number; body: string } {
   const configuredToken = process.env.META_WA_VERIFY_TOKEN?.replace(/^["']|["']$/g, '').trim();
   const defaultToken = 'zhat_beauty_secure_webhook_verify_token';
@@ -206,193 +239,272 @@ function getAutomatedReply(messageText: string): string | null {
 }
 
 /**
- * Safely extracts raw buffer from incoming request
+ * Process verified Meta payload
  */
-async function getRawBodyBuffer(req: any): Promise<Buffer> {
-  if (req.rawBody) {
-    return Buffer.isBuffer(req.rawBody) ? req.rawBody : Buffer.from(req.rawBody);
-  }
+async function processVerifiedPayload(rawText: string, correlationId: string) {
+  try {
+    const payload = JSON.parse(rawText);
+    const entries = Array.isArray(payload?.entry) ? payload.entry : [];
 
-  if (Buffer.isBuffer(req.body)) {
-    return req.body;
-  }
+    for (const entry of entries) {
+      const changes = Array.isArray(entry?.changes) ? entry.changes : [];
+      for (const change of changes) {
+        if (change?.field !== 'messages') continue;
+        const value = change.value;
+        if (!value) continue;
 
-  if (typeof req.body === 'string') {
-    return Buffer.from(req.body, 'utf8');
-  }
+        // Inbound Customer Messages
+        if (Array.isArray(value.messages)) {
+          for (const msg of value.messages) {
+            const messageId = msg.id;
+            if (!messageId) continue;
 
-  if (req.body && typeof req.body === 'object') {
-    console.warn(
-      '[Meta WhatsApp Webhook - Vercel] Warning: req.body was pre-parsed into an object by runtime middleware. Raw byte stream is preferred for HMAC validation.'
-    );
-    return Buffer.from(JSON.stringify(req.body), 'utf8');
-  }
+            // Deduplication
+            if (processedMessageIds.has(messageId)) {
+              console.log(`[Meta WhatsApp Webhook] [${correlationId}] Duplicate message skipped: ${messageId}`);
+              continue;
+            }
 
-  return new Promise<Buffer>((resolve, reject) => {
-    const chunks: Buffer[] = [];
+            processedMessageIds.add(messageId);
+            if (processedMessageIds.size > MAX_CACHE_SIZE) {
+              const oldest = processedMessageIds.values().next().value;
+              if (oldest) processedMessageIds.delete(oldest);
+            }
 
-    // Read any immediately available chunks if stream was paused
-    if (typeof req.read === 'function') {
-      let chunk;
-      while (null !== (chunk = req.read())) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+            const fromPhone = `+${msg.from}`;
+            let messageText = '';
+            if (msg.type === 'text' && msg.text?.body) {
+              messageText = msg.text.body;
+            } else if (msg.type === 'interactive') {
+              messageText =
+                msg.interactive?.button_reply?.title ||
+                msg.interactive?.list_reply?.title ||
+                'User interactive selection';
+            } else if (msg.type === 'button' && msg.button?.text) {
+              messageText = msg.button.text;
+            } else {
+              messageText = `[Customer sent a ${msg.type || 'media'} message]`;
+            }
+
+            console.log(
+              `[Meta WhatsApp Webhook] [${correlationId}] Inbound message from ${maskPhoneNumber(fromPhone)} (ID: ${messageId})`
+            );
+
+            // Auto-reply
+            const autoReply = getAutomatedReply(messageText);
+            if (autoReply) {
+              console.log(
+                `[Meta WhatsApp Webhook] [${correlationId}] Dispatching auto-reply to ${maskPhoneNumber(fromPhone)}`
+              );
+              await sendMetaCloudTextMessage(fromPhone, autoReply);
+            }
+          }
+        }
+
+        // Outbound Status Updates (sent, delivered, read)
+        if (Array.isArray(value.statuses)) {
+          for (const status of value.statuses) {
+            console.log(
+              `[Meta WhatsApp Webhook] [${correlationId}] Status update for message ${status.id}: ${status.status}`
+            );
+          }
+        }
       }
     }
+  } catch (err: any) {
+    console.error(`[Meta WhatsApp Webhook] [${correlationId}] Async processing error:`, err.message);
+  }
+}
 
-    req.on('data', (c: any) => {
-      chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
-    });
+// =============================================================================
+// MODERN VERCEL SERVERLESS FUNCTION: WEB STANDARDS ROUTE HANDLERS
+// In modern Vercel Functions, named exports (GET, POST) receive native Web Request
+// objects without any pre-parsing middleware, guaranteeing 100% raw byte capture.
+// =============================================================================
 
-    req.on('end', () => {
-      resolve(Buffer.concat(chunks));
-    });
+/**
+ * Modern Vercel GET Handler: Meta Webhook Subscription Verification
+ */
+export async function GET(request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  const mode = url.searchParams.get('hub.mode');
+  const token = url.searchParams.get('hub.verify_token');
+  const challenge = url.searchParams.get('hub.challenge');
 
-    req.on('error', (err: any) => {
-      reject(err);
-    });
-
-    // If stream has already ended and read() drained it
-    if (req.readableEnded && chunks.length > 0) {
-      resolve(Buffer.concat(chunks));
-    }
+  const verification = handleWebhookVerification(mode, token, challenge);
+  return new Response(verification.body, {
+    status: verification.status,
+    headers: { 'Content-Type': 'text/plain; charset=utf-8' },
   });
 }
 
 /**
- * Canonical Vercel Serverless Function Handler
- * Route: /api/webhooks/whatsapp
- * Self-contained: No external uncompiled TypeScript module resolution errors.
+ * Modern Vercel POST Handler: Inbound Webhook Events
+ * Uses request.arrayBuffer() directly to capture the exact, unparsed raw bytes.
  */
-export default async function handler(req: any, res: any) {
-  const parsedUrl = parseUrl(req.url || '', true);
+export async function POST(request: Request): Promise<Response> {
+  const correlationId = `wh_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
+  try {
+    // 1. Read exact raw bytes from native Web Request stream BEFORE any JSON parsing
+    const arrayBuffer = await request.arrayBuffer();
+    const rawBuffer = Buffer.from(arrayBuffer);
+
+    // 2. Validate X-Hub-Signature-256 using META_WA_APP_SECRET
+    const signatureHeader = request.headers.get('x-hub-signature-256');
+    const signatureCheck = verifyHubSignature(rawBuffer, signatureHeader);
+    const secretDiag = inspectSecret('META_WA_APP_SECRET');
+
+    // 3. Safe diagnostic logging (Never logs secrets, access tokens, or customer messages)
+    console.log(
+      `[Meta WhatsApp Webhook - Vercel WebStandard] [${correlationId}] ` +
+      `source=request.arrayBuffer ` +
+      `bytes=${rawBuffer.length} ` +
+      `sigHeader=${Boolean(signatureHeader)} ` +
+      `secretConfigured=${secretDiag.configured} ` +
+      `secretLength=${secretDiag.trimmedLength} ` +
+      `secretHasQuotes=${secretDiag.hasWrappingQuotes} ` +
+      `secretHasWhitespace=${secretDiag.hasWhitespace} ` +
+      `valid=${signatureCheck.valid} ` +
+      `${signatureCheck.reason ? `reason="${signatureCheck.reason}"` : 'status=OK'}`
+    );
+
+    if (!signatureCheck.valid) {
+      console.warn(
+        `[Meta WhatsApp Webhook - Vercel WebStandard] [${correlationId}] Request rejected: ${signatureCheck.reason}`
+      );
+      return new Response(
+        JSON.stringify({
+          error: 'Invalid signature',
+          reason: signatureCheck.reason,
+          correlationId,
+        }),
+        {
+          status: 403,
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+    }
+
+    // 4. Immediately return 200 EVENT_RECEIVED to satisfy Meta's 20-second timeout
+    const rawText = rawBuffer.toString('utf8');
+    if (rawText.trim()) {
+      // Process payload asynchronously in background
+      processVerifiedPayload(rawText, correlationId).catch((err) =>
+        console.error(`[Meta WhatsApp Webhook] [${correlationId}] Background error:`, err.message)
+      );
+    }
+
+    return new Response('EVENT_RECEIVED', {
+      status: 200,
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+    });
+  } catch (err: any) {
+    console.error(`[Meta WhatsApp Webhook - Vercel WebStandard] [${correlationId}] Processing error:`, err.message);
+    return new Response('Internal Server Error', { status: 500 });
+  }
+}
+
+// =============================================================================
+// BACKWARDS-COMPATIBLE DEFAULT EXPORT (Node.js (req, res) & Test Runners)
+// =============================================================================
+
+export default async function handler(req: any, res?: any): Promise<any> {
+  // If invoked with a Web Standard Request (e.g. Edge or modern runtime adapter)
+  if (req instanceof Request || (arguments.length === 1 && typeof req?.arrayBuffer === 'function')) {
+    const method = req.method?.toUpperCase();
+    if (method === 'GET') return GET(req);
+    if (method === 'POST') return POST(req);
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+
+  // Legacy Node.js (req, res) handler
   const method = req.method?.toUpperCase();
 
-  // -------------------------------------------------------------
-  // GET: Meta Webhook Subscription Verification
-  // -------------------------------------------------------------
   if (method === 'GET') {
-    const query = req.query || parsedUrl.query || {};
-    const mode = (query['hub.mode'] || '') as string;
-    const token = (query['hub.verify_token'] || '') as string;
-    const challenge = (query['hub.challenge'] || '') as string;
+    const url = new URL(req.url || '', 'http://localhost');
+    const mode = (req.query?.['hub.mode'] || url.searchParams.get('hub.mode')) as string;
+    const token = (req.query?.['hub.verify_token'] || url.searchParams.get('hub.verify_token')) as string;
+    const challenge = (req.query?.['hub.challenge'] || url.searchParams.get('hub.challenge')) as string;
 
     const verification = handleWebhookVerification(mode, token, challenge);
-    res.setHeader('Content-Type', 'text/plain');
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.statusCode = verification.status;
     return res.end(verification.body);
   }
 
-  // -------------------------------------------------------------
-  // POST: Inbound Messages & Delivery Status Updates
-  // -------------------------------------------------------------
   if (method === 'POST') {
+    const correlationId = `wh_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     try {
-      // 1. Read raw request buffer for cryptographic HMAC verification
-      const rawBuffer = await getRawBodyBuffer(req);
+      let rawBuffer: Buffer;
+      let bodySource = 'stream';
 
-      // 2. Validate X-Hub-Signature-256 using META_WA_APP_SECRET
-      const signatureHeader = (req.headers['x-hub-signature-256'] || '') as string;
+      if (req.rawBody) {
+        rawBuffer = Buffer.isBuffer(req.rawBody) ? req.rawBody : Buffer.from(req.rawBody);
+        bodySource = 'req.rawBody';
+      } else if (Buffer.isBuffer(req.body)) {
+        rawBuffer = req.body;
+        bodySource = 'req.body(Buffer)';
+      } else if (typeof req.body === 'string') {
+        rawBuffer = Buffer.from(req.body, 'utf8');
+        bodySource = 'req.body(string)';
+      } else if (req.body && typeof req.body === 'object') {
+        console.warn(
+          '[Meta WhatsApp Webhook - Vercel] Warning: req.body was pre-parsed into an object by runtime middleware. Raw byte stream is required for exact HMAC verification.'
+        );
+        rawBuffer = Buffer.from(JSON.stringify(req.body), 'utf8');
+        bodySource = 'req.body(object-fallback)';
+      } else {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        rawBuffer = Buffer.concat(chunks);
+        bodySource = 'stream(for-await)';
+      }
+
+      const signatureHeader = (req.headers?.['x-hub-signature-256'] || '') as string;
       const signatureCheck = verifyHubSignature(rawBuffer, signatureHeader);
+      const secretDiag = inspectSecret('META_WA_APP_SECRET');
+
+      console.log(
+        `[Meta WhatsApp Webhook - Vercel Legacy] [${correlationId}] ` +
+        `source=${bodySource} ` +
+        `bytes=${rawBuffer.length} ` +
+        `sigHeader=${Boolean(signatureHeader)} ` +
+        `secretConfigured=${secretDiag.configured} ` +
+        `secretLength=${secretDiag.trimmedLength} ` +
+        `secretHasQuotes=${secretDiag.hasWrappingQuotes} ` +
+        `secretHasWhitespace=${secretDiag.hasWhitespace} ` +
+        `valid=${signatureCheck.valid} ` +
+        `${signatureCheck.reason ? `reason="${signatureCheck.reason}"` : 'status=OK'}`
+      );
 
       if (!signatureCheck.valid) {
-        console.warn(
-          `[Meta WhatsApp Webhook - Vercel] Request rejected: ${signatureCheck.reason}`
-        );
         res.statusCode = 403;
         res.setHeader('Content-Type', 'application/json');
         return res.end(
-          JSON.stringify({ error: 'Invalid signature', reason: signatureCheck.reason })
+          JSON.stringify({
+            error: 'Invalid signature',
+            reason: signatureCheck.reason,
+            correlationId,
+          })
         );
       }
 
-      // 3. Immediately respond with 200 OK to satisfy Meta's 20-second timeout
       res.statusCode = 200;
-      res.setHeader('Content-Type', 'text/plain');
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
       res.end('EVENT_RECEIVED');
 
-      // 4. Parse JSON payload ONLY after successful signature verification
       const rawText = rawBuffer.toString('utf8');
-      if (!rawText.trim()) return;
-
-      let payload: any;
-      try {
-        payload = JSON.parse(rawText);
-      } catch (parseErr: any) {
-        console.error('[Meta WhatsApp Webhook] Failed to parse JSON payload:', parseErr.message);
-        return;
+      if (rawText.trim()) {
+        processVerifiedPayload(rawText, correlationId).catch((err) =>
+          console.error(`[Meta WhatsApp Webhook] [${correlationId}] Error:`, err.message)
+        );
       }
-
-      const entries = Array.isArray(payload?.entry) ? payload.entry : [];
-
-      for (const entry of entries) {
-        const changes = Array.isArray(entry?.changes) ? entry.changes : [];
-        for (const change of changes) {
-          if (change?.field !== 'messages') continue;
-          const value = change.value;
-          if (!value) continue;
-
-          // Inbound Customer Messages
-          if (Array.isArray(value.messages)) {
-            for (const msg of value.messages) {
-              const messageId = msg.id;
-              if (!messageId) continue;
-
-              // Deduplication
-              if (processedMessageIds.has(messageId)) {
-                console.log(`[Meta WhatsApp Webhook] Duplicate message skipped: ${messageId}`);
-                continue;
-              }
-
-              processedMessageIds.add(messageId);
-              if (processedMessageIds.size > MAX_CACHE_SIZE) {
-                const oldest = processedMessageIds.values().next().value;
-                if (oldest) processedMessageIds.delete(oldest);
-              }
-
-              const fromPhone = `+${msg.from}`;
-              let messageText = '';
-              if (msg.type === 'text' && msg.text?.body) {
-                messageText = msg.text.body;
-              } else if (msg.type === 'interactive') {
-                messageText =
-                  msg.interactive?.button_reply?.title ||
-                  msg.interactive?.list_reply?.title ||
-                  'User interactive selection';
-              } else if (msg.type === 'button' && msg.button?.text) {
-                messageText = msg.button.text;
-              } else {
-                messageText = `[Customer sent a ${msg.type || 'media'} message]`;
-              }
-
-              console.log(
-                `[Meta WhatsApp Webhook] Received message from ${maskPhoneNumber(fromPhone)} (ID: ${messageId})`
-              );
-
-              // Auto-reply
-              const autoReply = getAutomatedReply(messageText);
-              if (autoReply) {
-                console.log(
-                  `[Meta WhatsApp Webhook] Dispatching auto-reply to ${maskPhoneNumber(fromPhone)}`
-                );
-                await sendMetaCloudTextMessage(fromPhone, autoReply);
-              }
-            }
-          }
-
-          // Outbound Status Updates (sent, delivered, read)
-          if (Array.isArray(value.statuses)) {
-            for (const status of value.statuses) {
-              console.log(
-                `[Meta WhatsApp Webhook] Status update for message ${status.id}: ${status.status}`
-              );
-            }
-          }
-        }
-      }
-
       return;
     } catch (err: any) {
-      console.error('[Meta WhatsApp Webhook - Vercel] Processing error:', err.message);
+      console.error(`[Meta WhatsApp Webhook - Vercel Legacy] [${correlationId}] Error:`, err.message);
       if (!res.writableEnded) {
         res.statusCode = 500;
         return res.end('Internal Server Error');
@@ -400,7 +512,6 @@ export default async function handler(req: any, res: any) {
     }
   }
 
-  // Method not allowed
   res.statusCode = 405;
   return res.end('Method Not Allowed');
 }

@@ -1,6 +1,9 @@
 import crypto from 'crypto';
 import handler, {
+  GET,
+  POST,
   handleWebhookVerification,
+  inspectSecret,
   verifyHubSignature,
 } from '../api/webhooks/whatsapp';
 
@@ -66,53 +69,152 @@ async function runTestSuite() {
     }
   }
 
-  // 1. Valid signature and valid JSON payload
-  const validBuffer = Buffer.from(validPayload, 'utf8');
-  const validSig = computeSignature(validBuffer, TEST_APP_SECRET);
-  const res1 = verifyHubSignature(validBuffer, validSig);
-  assert('1. Valid signature and valid payload', res1.valid === true, res1.reason);
-
-  // 2. Invalid signature (computed with wrong secret or tampered hash)
-  const wrongSecretSig = computeSignature(validBuffer, 'wrong_secret_abcdef123456');
-  const res2 = verifyHubSignature(validBuffer, wrongSecretSig);
+  // 1. Independent Golden Vector Test 1 (RFC-Style precomputed verification)
+  // Ensures test cannot pass from self-referential generator bugs
+  process.env.META_WA_APP_SECRET = 'known_test_secret_for_regression_verification_only';
+  const goldenPayload1 = Buffer.from('{"test":"known_payload"}', 'utf8');
+  const goldenHeader1 = 'sha256=6815565f8fea1dcdcae400e773f2003d2b5b69f025bbda36a1bf7515d9125163';
+  const goldenRes1 = verifyHubSignature(goldenPayload1, goldenHeader1);
   assert(
-    '2. Invalid signature rejection',
-    res2.valid === false && res2.reason === 'Cryptographic signature mismatch',
-    res2.reason
+    '1. Independent Golden Vector 1 (Precomputed known HMAC constant)',
+    goldenRes1.valid === true,
+    goldenRes1.reason
   );
 
-  // 3. Missing signature header
-  const res3a = verifyHubSignature(validBuffer, undefined);
-  const res3b = verifyHubSignature(validBuffer, '');
-  assert('3. Missing signature header', res3a.valid === false && res3b.valid === false);
+  // 2. Independent Golden Vector Test 2 (Exact Meta Webhook Payload Format)
+  process.env.META_WA_APP_SECRET = 'meta_test_secret_32_characters_123';
+  const goldenPayload2 = Buffer.from(
+    '{"object":"whatsapp_business_account","entry":[{"id":"0","changes":[{"value":{"messaging_product":"whatsapp","metadata":{"display_phone_number":"16505551111","phone_number_id":"123456123"},"contacts":[{"profile":{"name":"test user name"},"wa_id":"16315551181"}],"messages":[{"from":"16315551181","id":"wamid.HBgL...","timestamp":"1528497807","text":{"body":"test text message"},"type":"text"}]},"field":"messages"}]}]}',
+    'utf8'
+  );
+  const goldenHeader2 = 'sha256=ce928a6a5b9b93321bdfd63cd575892afb2a77030bb61d1817a0275e395ce462';
+  const goldenRes2 = verifyHubSignature(goldenPayload2, goldenHeader2);
+  assert(
+    '2. Independent Golden Vector 2 (Precomputed Meta Developer Portal test payload)',
+    goldenRes2.valid === true,
+    goldenRes2.reason
+  );
 
-  // 4. Malformed signature headers
-  const res4a = verifyHubSignature(validBuffer, 'not_sha256=123456');
-  const res4b = verifyHubSignature(validBuffer, 'sha256=short');
-  const res4c = verifyHubSignature(
+  // Reset to suite secret
+  process.env.META_WA_APP_SECRET = TEST_APP_SECRET;
+
+  // 3. Regression Test: Signature over EXACT bytes including whitespace differences
+  // Payload with newlines and indentation:
+  const whitespacePayload = '{\n  "object": "whatsapp_business_account",\n  "entry": [\n    {\n      "id": "123"\n    }\n  ]\n}';
+  const whitespaceBuf = Buffer.from(whitespacePayload, 'utf8');
+  const whitespaceSig = computeSignature(whitespaceBuf, TEST_APP_SECRET);
+
+  // Raw whitespace payload with exact signature must PASS:
+  const res3a = verifyHubSignature(whitespaceBuf, whitespaceSig);
+  assert('3a. Exact raw bytes with whitespace verifies successfully', res3a.valid === true, res3a.reason);
+
+  // If payload is parsed and re-stringified (compact, losing whitespace),
+  // validating against whitespaceSig must FAIL because bytes changed:
+  const reStringifiedBuf = Buffer.from(JSON.stringify(JSON.parse(whitespacePayload)), 'utf8');
+  const res3b = verifyHubSignature(reStringifiedBuf, whitespaceSig);
+  assert(
+    '3b. Re-serialized JSON without whitespace correctly fails HMAC verification',
+    res3b.valid === false && res3b.reason === 'Cryptographic signature mismatch'
+  );
+
+  // 4. Modern Web Standards POST Handler: request.arrayBuffer() preserves exact bytes
+  const webRequestGood = new Request('https://zhatbeauty.vercel.app/api/webhooks/whatsapp', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-hub-signature-256': whitespaceSig,
+    },
+    body: whitespacePayload,
+  });
+  const webResponseGood = await POST(webRequestGood);
+  const webTextGood = await webResponseGood.text();
+  assert(
+    '4. Modern Web Standards POST handler accepts raw unparsed stream',
+    webResponseGood.status === 200 && webTextGood === 'EVENT_RECEIVED'
+  );
+
+  // 5. Modern Web Standards POST Handler: Rejects invalid signature with 403
+  const webRequestBad = new Request('https://zhatbeauty.vercel.app/api/webhooks/whatsapp', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-hub-signature-256': 'sha256=wronghash123456789012345678901234567890123456789012345678901234567890',
+    },
+    body: whitespacePayload,
+  });
+  const webResponseBad = await POST(webRequestBad);
+  assert('5. Modern Web Standards POST handler returns 403 for invalid signature', webResponseBad.status === 403);
+
+  // 6. Modern Web Standards GET Handler: Verification challenge handshake
+  const webRequestGet = new Request(
+    'https://zhatbeauty.vercel.app/api/webhooks/whatsapp?hub.mode=subscribe&hub.verify_token=test_verify_token_123&hub.challenge=test_web_challenge_99',
+    { method: 'GET' }
+  );
+  const webResponseGet = await GET(webRequestGet);
+  const webTextGet = await webResponseGet.text();
+  assert(
+    '6. Modern Web Standards GET handler succeeds with challenge body',
+    webResponseGet.status === 200 && webTextGet === 'test_web_challenge_99'
+  );
+
+  // 7. Invalid signature (computed with wrong secret)
+  const validBuffer = Buffer.from(validPayload, 'utf8');
+  const wrongSecretSig = computeSignature(validBuffer, 'wrong_secret_abcdef123456');
+  const res7 = verifyHubSignature(validBuffer, wrongSecretSig);
+  assert(
+    '7. Invalid signature rejection',
+    res7.valid === false && res7.reason === 'Cryptographic signature mismatch',
+    res7.reason
+  );
+
+  // 8. Missing signature header
+  const res8a = verifyHubSignature(validBuffer, undefined);
+  const res8b = verifyHubSignature(validBuffer, '');
+  assert('8. Missing signature header', res8a.valid === false && res8b.valid === false);
+
+  // 9. Malformed signature headers
+  const res9a = verifyHubSignature(validBuffer, 'not_sha256=123456');
+  const res9b = verifyHubSignature(validBuffer, 'sha256=short');
+  const res9c = verifyHubSignature(
     validBuffer,
     'sha256=zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz'
   );
   assert(
-    '4. Malformed signature header formats',
-    res4a.valid === false && res4b.valid === false && res4c.valid === false
+    '9. Malformed signature header formats',
+    res9a.valid === false && res9b.valid === false && res9c.valid === false
   );
 
-  // 5. Modified / tampered payload with original signature
+  // 10. Modified / tampered payload with original signature
+  const validSig = computeSignature(validBuffer, TEST_APP_SECRET);
   const tamperedBuffer = Buffer.from(validPayload.replace('Amina Test', 'Attacker Name'), 'utf8');
-  const res5 = verifyHubSignature(tamperedBuffer, validSig);
+  const res10 = verifyHubSignature(tamperedBuffer, validSig);
   assert(
-    '5. Modified payload rejection',
-    res5.valid === false && res5.reason === 'Cryptographic signature mismatch'
+    '10. Modified payload rejection',
+    res10.valid === false && res10.reason === 'Cryptographic signature mismatch'
   );
 
-  // 6. Empty request body
+  // 11. Empty request body
   const emptyBuffer = Buffer.alloc(0);
   const emptySig = computeSignature(emptyBuffer, TEST_APP_SECRET);
-  const res6 = verifyHubSignature(emptyBuffer, emptySig);
-  assert('6. Empty request body detection', res6.valid === false && res6.reason === 'Empty request body');
+  const res11 = verifyHubSignature(emptyBuffer, emptySig);
+  assert('11. Empty request body detection', res11.valid === false && res11.reason === 'Empty request body');
 
-  // 7. Full Handler Invocation & Duplicate Webhook Event Deduplication
+  // 12. Secret with accidental surrounding quotation marks in environment
+  process.env.META_WA_APP_SECRET = `"${TEST_APP_SECRET}"`;
+  const res12 = verifyHubSignature(validBuffer, validSig);
+  assert('12. Secret with wrapping quotes correctly sanitized', res12.valid === true, res12.reason);
+  process.env.META_WA_APP_SECRET = TEST_APP_SECRET;
+
+  // 13. Safe Secret Inspector Test (Confirms secret is never leaked)
+  const secretInspection = inspectSecret('META_WA_APP_SECRET');
+  assert(
+    '13. Safe Secret Inspector (Reports metadata without exposing value)',
+    secretInspection.configured === true &&
+      secretInspection.trimmedLength === TEST_APP_SECRET.length &&
+      secretInspection.hasWrappingQuotes === false
+  );
+
+  // 14. Full Handler Invocation & Duplicate Webhook Event Deduplication
   const testMessageId = `wamid.DEDUP_TEST_${Date.now()}`;
   const dedupPayload = JSON.stringify({
     object: 'whatsapp_business_account',
@@ -168,7 +270,7 @@ async function runTestSuite() {
   // First invocation
   await handler(mockReq1, mockRes1);
   assert(
-    '7a. Handler accepts valid POST payload',
+    '14a. Handler accepts valid POST payload and logs correlation ID',
     mockRes1.statusCode === 200 && firstBody === 'EVENT_RECEIVED'
   );
 
@@ -199,19 +301,9 @@ async function runTestSuite() {
 
   await handler(mockReq2, mockRes2);
   assert(
-    '7b. Handler acknowledges duplicate without re-processing',
+    '14b. Handler acknowledges duplicate without re-processing',
     mockRes2.statusCode === 200 && secondBody === 'EVENT_RECEIVED'
   );
-
-  // 8. GET Verification Check
-  const getSuccess = handleWebhookVerification('subscribe', 'test_verify_token_123', 'chal_778899');
-  assert(
-    '8a. GET verification with valid token',
-    getSuccess.status === 200 && getSuccess.body === 'chal_778899'
-  );
-
-  const getFailure = handleWebhookVerification('subscribe', 'wrong_token', 'chal_778899');
-  assert('8b. GET verification with wrong token rejected', getFailure.status === 403);
 
   console.log(`\nTEST SUMMARY: ${passCount} PASSED, ${failCount} FAILED.`);
   if (failCount > 0) {
