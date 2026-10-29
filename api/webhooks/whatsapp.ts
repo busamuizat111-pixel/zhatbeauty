@@ -29,7 +29,8 @@ export function verifyHubSignature(
   rawBuffer: Buffer,
   signatureHeader: string | undefined
 ): { valid: boolean; reason?: string } {
-  const appSecret = process.env.META_WA_APP_SECRET?.trim();
+  // Strip optional wrapping quotes (e.g. if set in Vercel as "secret" or 'secret') and whitespace
+  const appSecret = process.env.META_WA_APP_SECRET?.replace(/^["']|["']$/g, '').trim();
 
   // If META_WA_APP_SECRET is not yet configured, log notice and permit in development
   if (!appSecret) {
@@ -39,22 +40,37 @@ export function verifyHubSignature(
     return { valid: true, reason: 'APP_SECRET_NOT_CONFIGURED' };
   }
 
-  if (!signatureHeader) {
+  // 1. Missing signature header
+  if (!signatureHeader || !signatureHeader.trim()) {
     return { valid: false, reason: 'Missing X-Hub-Signature-256 header' };
   }
 
-  const [algo, signature] = signatureHeader.split('=');
-  if (algo !== 'sha256' || !signature) {
+  // 2. Empty request body
+  if (!rawBuffer || rawBuffer.length === 0) {
+    return { valid: false, reason: 'Empty request body' };
+  }
+
+  // 3. Malformed signature header (must start with sha256=)
+  const trimmedHeader = signatureHeader.trim();
+  if (!trimmedHeader.toLowerCase().startsWith('sha256=')) {
     return { valid: false, reason: 'Malformed signature header (expected sha256=<hash>)' };
   }
 
+  // 4. Validate hex digest length (SHA-256 hex digest is exactly 64 hexadecimal characters)
+  const signatureHex = trimmedHeader.slice(7).trim();
+  if (!signatureHex || !/^[0-9a-fA-F]{64}$/.test(signatureHex)) {
+    return { valid: false, reason: 'Malformed signature header (expected 64-char hex digest)' };
+  }
+
   try {
+    // 5. Compute HMAC-SHA256 digest over the raw unparsed bytes
     const hmac = crypto.createHmac('sha256', appSecret);
     hmac.update(rawBuffer);
-    const expected = hmac.digest('hex');
+    const expectedHex = hmac.digest('hex'); // 64 hex characters, lowercase
 
-    const expectedBuffer = Buffer.from(expected, 'hex');
-    const actualBuffer = Buffer.from(signature, 'hex');
+    // 6. Timing-safe comparison to prevent timing attacks
+    const expectedBuffer = Buffer.from(expectedHex, 'utf8');
+    const actualBuffer = Buffer.from(signatureHex.toLowerCase(), 'utf8');
 
     if (expectedBuffer.length !== actualBuffer.length) {
       return { valid: false, reason: 'Signature length mismatch' };
@@ -79,7 +95,7 @@ export function handleWebhookVerification(
   token: string | undefined,
   challenge: string | undefined
 ): { status: number; body: string } {
-  const configuredToken = process.env.META_WA_VERIFY_TOKEN?.trim();
+  const configuredToken = process.env.META_WA_VERIFY_TOKEN?.replace(/^["']|["']$/g, '').trim();
   const defaultToken = 'zhat_beauty_secure_webhook_verify_token';
   const isTokenMatch = token && (token === configuredToken || token === defaultToken);
 
@@ -101,8 +117,8 @@ async function sendMetaCloudTextMessage(
   toPhone: string,
   text: string
 ): Promise<{ success: boolean; messageId?: string; error?: string }> {
-  const accessToken = process.env.META_WA_ACCESS_TOKEN?.trim();
-  const phoneNumberId = process.env.META_WA_PHONE_NUMBER_ID?.trim();
+  const accessToken = process.env.META_WA_ACCESS_TOKEN?.replace(/^["']|["']$/g, '').trim();
+  const phoneNumberId = process.env.META_WA_PHONE_NUMBER_ID?.replace(/^["']|["']$/g, '').trim();
 
   if (!accessToken || !phoneNumberId || accessToken.startsWith('EAA...')) {
     return { success: false, error: 'Credentials not configured' };
@@ -196,17 +212,49 @@ async function getRawBodyBuffer(req: any): Promise<Buffer> {
   if (req.rawBody) {
     return Buffer.isBuffer(req.rawBody) ? req.rawBody : Buffer.from(req.rawBody);
   }
-  if (req.body) {
-    if (Buffer.isBuffer(req.body)) return req.body;
-    if (typeof req.body === 'string') return Buffer.from(req.body, 'utf8');
-    if (typeof req.body === 'object') return Buffer.from(JSON.stringify(req.body), 'utf8');
+
+  if (Buffer.isBuffer(req.body)) {
+    return req.body;
+  }
+
+  if (typeof req.body === 'string') {
+    return Buffer.from(req.body, 'utf8');
+  }
+
+  if (req.body && typeof req.body === 'object') {
+    console.warn(
+      '[Meta WhatsApp Webhook - Vercel] Warning: req.body was pre-parsed into an object by runtime middleware. Raw byte stream is preferred for HMAC validation.'
+    );
+    return Buffer.from(JSON.stringify(req.body), 'utf8');
   }
 
   return new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', (err: any) => reject(err));
+
+    // Read any immediately available chunks if stream was paused
+    if (typeof req.read === 'function') {
+      let chunk;
+      while (null !== (chunk = req.read())) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+    }
+
+    req.on('data', (c: any) => {
+      chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
+    });
+
+    req.on('end', () => {
+      resolve(Buffer.concat(chunks));
+    });
+
+    req.on('error', (err: any) => {
+      reject(err);
+    });
+
+    // If stream has already ended and read() drained it
+    if (req.readableEnded && chunks.length > 0) {
+      resolve(Buffer.concat(chunks));
+    }
   });
 }
 
@@ -262,11 +310,18 @@ export default async function handler(req: any, res: any) {
       res.setHeader('Content-Type', 'text/plain');
       res.end('EVENT_RECEIVED');
 
-      // 4. Parse JSON payload and process asynchronously
+      // 4. Parse JSON payload ONLY after successful signature verification
       const rawText = rawBuffer.toString('utf8');
       if (!rawText.trim()) return;
 
-      const payload = JSON.parse(rawText);
+      let payload: any;
+      try {
+        payload = JSON.parse(rawText);
+      } catch (parseErr: any) {
+        console.error('[Meta WhatsApp Webhook] Failed to parse JSON payload:', parseErr.message);
+        return;
+      }
+
       const entries = Array.isArray(payload?.entry) ? payload.entry : [];
 
       for (const entry of entries) {

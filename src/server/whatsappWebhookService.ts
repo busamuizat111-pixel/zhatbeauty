@@ -19,7 +19,7 @@ export function verifyHubSignature(
   rawBody: Buffer | string,
   signatureHeader: string | undefined
 ): { valid: boolean; reason?: string } {
-  const appSecret = process.env.META_WA_APP_SECRET?.trim();
+  const appSecret = process.env.META_WA_APP_SECRET?.replace(/^["']|["']$/g, '').trim();
 
   // If META_WA_APP_SECRET is not configured, warn and allow processing (for initial dev / test environments)
   if (!appSecret) {
@@ -29,23 +29,32 @@ export function verifyHubSignature(
     return { valid: true, reason: 'APP_SECRET_NOT_CONFIGURED' };
   }
 
-  if (!signatureHeader) {
+  if (!signatureHeader || !signatureHeader.trim()) {
     return { valid: false, reason: 'Missing X-Hub-Signature-256 header' };
   }
 
-  const [algo, signature] = signatureHeader.split('=');
-  if (algo !== 'sha256' || !signature) {
+  const rawBuffer = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody, 'utf8');
+  if (rawBuffer.length === 0) {
+    return { valid: false, reason: 'Empty request body' };
+  }
+
+  const trimmedHeader = signatureHeader.trim();
+  if (!trimmedHeader.toLowerCase().startsWith('sha256=')) {
     return { valid: false, reason: 'Malformed signature header (expected sha256=<hash>)' };
   }
 
+  const signatureHex = trimmedHeader.slice(7).trim();
+  if (!signatureHex || !/^[0-9a-fA-F]{64}$/.test(signatureHex)) {
+    return { valid: false, reason: 'Malformed signature header (expected 64-char hex digest)' };
+  }
+
   try {
-    const rawBuffer = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody, 'utf8');
     const hmac = crypto.createHmac('sha256', appSecret);
     hmac.update(rawBuffer);
-    const expected = hmac.digest('hex');
+    const expectedHex = hmac.digest('hex');
 
-    const expectedBuffer = Buffer.from(expected, 'hex');
-    const actualBuffer = Buffer.from(signature, 'hex');
+    const expectedBuffer = Buffer.from(expectedHex, 'utf8');
+    const actualBuffer = Buffer.from(signatureHex.toLowerCase(), 'utf8');
 
     if (expectedBuffer.length !== actualBuffer.length) {
       return { valid: false, reason: 'Signature length mismatch' };
