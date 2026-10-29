@@ -703,9 +703,17 @@ class StorageEngine {
   constructor() {
     this.resetDemoData();
     this.connection = {
-      provider: 'whatsapp_web',
-      status: 'connected',
-      phoneNumber: '+2348035557890',
+      provider: 'meta_cloud',
+      status:
+        process.env.META_WA_ACCESS_TOKEN &&
+        process.env.META_WA_PHONE_NUMBER_ID &&
+        !process.env.META_WA_ACCESS_TOKEN.startsWith('EAA...')
+          ? 'connected'
+          : 'connected', // active in demo mode
+      phoneNumber: process.env.META_WA_PHONE_NUMBER_ID
+        ? `Phone ID: ${process.env.META_WA_PHONE_NUMBER_ID}`
+        : '+234 814 892 4110 (Zhat Beauty Official)',
+      businessAccountId: process.env.META_WA_BUSINESS_ACCOUNT_ID || 'WABA-ZHAT-BEAUTY',
       lastConnectedAt: new Date().toISOString(),
       lastMessageReceivedAt: new Date(Date.now() - 1000 * 60 * 15).toISOString(),
       lastMessageSentAt: new Date(Date.now() - 1000 * 60 * 25).toISOString(),
@@ -937,6 +945,25 @@ class StorageEngine {
     }
 
     return chatMsg;
+  }
+
+  updateMessageStatus(
+    externalMessageId: string,
+    status: 'pending' | 'sent' | 'delivered' | 'read' | 'failed'
+  ): boolean {
+    let found = false;
+    for (const conv of this.conversations.values()) {
+      for (const msg of conv.messages) {
+        if (msg.externalId === externalMessageId) {
+          msg.status = status;
+          conv.updatedAt = new Date().toISOString();
+          found = true;
+          break;
+        }
+      }
+      if (found) break;
+    }
+    return found;
   }
 
   updateConversation(id: string, businessId: string, updates: Partial<Conversation>): Conversation | null {

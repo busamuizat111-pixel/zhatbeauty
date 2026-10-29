@@ -242,7 +242,7 @@ export const api = {
     return res.json();
   },
 
-  async connectWhatsApp(provider: 'whatsapp_web' | 'meta_cloud'): Promise<any> {
+  async connectWhatsApp(provider: string = 'meta_cloud'): Promise<any> {
     const res = await fetch('/api/whatsapp/connect', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

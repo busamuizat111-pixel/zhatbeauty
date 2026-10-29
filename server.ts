@@ -11,8 +11,12 @@ import {
 } from './src/lib/validations';
 import { evaluateAutomatedResponse } from './src/server/automatedResponses';
 import { MetaCloudAdapter } from './src/server/messaging/MetaCloudAdapter';
-import { WhatsAppWebAdapter } from './src/server/messaging/WhatsAppWebAdapter';
 import { DEFAULT_BUSINESS_ID, storage } from './src/server/storage';
+import {
+  handleWebhookVerification,
+  processWebhookPayload,
+  verifyHubSignature,
+} from './src/server/whatsappWebhookService';
 
 dotenv.config();
 
@@ -23,16 +27,20 @@ const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 const isProduction = process.env.NODE_ENV === 'production';
 
-app.use(express.json());
+// Parse JSON body while capturing raw buffer for HMAC X-Hub-Signature-256 verification
+app.use(
+  express.json({
+    verify: (req: any, _res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 
-// Initialize messaging adapters
-const waWebAdapter = new WhatsAppWebAdapter();
+// Official Meta WhatsApp Cloud API Adapter (Exclusive messaging provider)
 const metaCloudAdapter = new MetaCloudAdapter();
 
 function getActiveAdapter() {
-  const settings = storage.getSettings(DEFAULT_BUSINESS_ID);
-  const conn = storage.getConnectionInfo();
-  return conn.provider === 'meta_cloud' ? metaCloudAdapter : waWebAdapter;
+  return metaCloudAdapter;
 }
 
 // -------------------------------------------------------------
@@ -416,27 +424,15 @@ app.get('/api/whatsapp/status', async (req, res) => {
 });
 
 app.post('/api/whatsapp/connect', async (req, res) => {
-  const { provider } = req.body;
-  if (provider === 'meta_cloud') {
-    storage.updateConnectionInfo({ provider: 'meta_cloud' });
-    const result = await metaCloudAdapter.connect();
-    storage.updateConnectionInfo({
-      status: result.status,
-      phoneNumber: result.phoneNumber,
-      errorDetails: result.status === 'error' ? result.message : undefined,
-    });
-    return res.json(result);
-  } else {
-    storage.updateConnectionInfo({ provider: 'whatsapp_web' });
-    const result = await waWebAdapter.connect();
-    storage.updateConnectionInfo({
-      status: result.status,
-      qrCode: result.qrCode,
-      phoneNumber: result.phoneNumber,
-      errorDetails: result.status === 'error' ? result.message : undefined,
-    });
-    return res.json(result);
-  }
+  storage.updateConnectionInfo({ provider: 'meta_cloud' });
+  const result = await metaCloudAdapter.connect();
+  storage.updateConnectionInfo({
+    provider: 'meta_cloud',
+    status: result.status,
+    phoneNumber: result.phoneNumber,
+    errorDetails: result.status === 'error' ? result.message : undefined,
+  });
+  return res.json(result);
 });
 
 app.post('/api/whatsapp/disconnect', async (req, res) => {
@@ -463,92 +459,37 @@ app.post('/api/whatsapp/test-message', async (req, res) => {
   res.json(result);
 });
 
-// Meta Webhook endpoint (GET for verification, POST for inbound messages)
-app.get('/api/whatsapp/webhook', (req, res) => {
-  const mode = req.query['hub.mode'] as string;
-  const token = req.query['hub.verify_token'] as string;
-  const challenge = req.query['hub.challenge'] as string;
+// Meta WhatsApp Cloud API Webhook endpoints (GET for challenge verification, POST for messages & status updates)
+const webhookPaths = ['/api/webhooks/whatsapp', '/api/whatsapp/webhook'];
 
-  const challengeResult = metaCloudAdapter.verifyWebhookChallenge(mode, token, challenge);
-  if (challengeResult) {
-    return res.status(200).send(challengeResult);
-  }
-  return res.sendStatus(403);
+app.get(webhookPaths, (req, res) => {
+  const mode = req.query['hub.mode'] as string | undefined;
+  const token = req.query['hub.verify_token'] as string | undefined;
+  const challenge = req.query['hub.challenge'] as string | undefined;
+
+  const result = handleWebhookVerification(mode, token, challenge);
+  return res.status(result.status).send(result.body);
 });
 
-app.post('/api/whatsapp/webhook', async (req, res) => {
+app.post(webhookPaths, async (req: any, res) => {
+  // 1. Validate X-Hub-Signature-256 using META_WA_APP_SECRET and raw request body
+  const signatureHeader = req.headers['x-hub-signature-256'] as string | undefined;
+  const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body || {}), 'utf8');
+
+  const verification = verifyHubSignature(rawBody, signatureHeader);
+  if (!verification.valid) {
+    console.warn(`[Meta WhatsApp Webhook] Rejected unauthorized request: ${verification.reason}`);
+    return res.status(403).json({ error: 'Invalid signature', reason: verification.reason });
+  }
+
+  // 2. Acknowledge receipt to Meta immediately (Meta requires fast HTTP 200 to prevent retries)
   res.status(200).send('EVENT_RECEIVED');
 
+  // 3. Process inbound messages and delivery statuses
   try {
-    const inbound = await metaCloudAdapter.receiveMessage(req.body);
-    if (!inbound) return;
-
-    // Associate with existing or new customer
-    let customer = storage.getCustomerByPhone(inbound.fromPhone, DEFAULT_BUSINESS_ID);
-    if (!customer) {
-      customer = storage.createCustomer({
-        businessId: DEFAULT_BUSINESS_ID,
-        name: inbound.fromName || 'WhatsApp Customer',
-        phone: inbound.fromPhone,
-        preferredChannel: 'whatsapp',
-        productsOfInterest: [],
-        notes: 'Created automatically via WhatsApp inbound message.',
-        status: 'lead',
-        consentGiven: true,
-        lastInteraction: inbound.timestamp,
-        lastEnquiryDate: inbound.timestamp,
-      });
-    }
-
-    // Locate or create conversation
-    let conv = storage
-      .getConversations(DEFAULT_BUSINESS_ID)
-      .find((c) => c.customerId === customer!.id);
-
-    if (!conv) {
-      conv = storage.createConversation({
-        businessId: DEFAULT_BUSINESS_ID,
-        customerId: customer.id,
-        customerName: customer.name,
-        customerPhone: customer.phone,
-        enquiryStatus: 'new',
-        lastMessageText: inbound.text,
-        lastMessageTimestamp: inbound.timestamp,
-        unreadCount: 1,
-        isPausedAutomation: false,
-        messages: [],
-      });
-    }
-
-    // Add message
-    storage.addMessageToConversation(conv.id, DEFAULT_BUSINESS_ID, {
-      sender: 'customer',
-      text: inbound.text,
-      status: 'delivered',
-      externalId: inbound.messageId,
-    });
-
-    // Evaluate automated assistant
-    const settings = storage.getSettings(DEFAULT_BUSINESS_ID);
-    const products = storage.getProducts(DEFAULT_BUSINESS_ID);
-    const autoEval = evaluateAutomatedResponse(
-      inbound.text,
-      settings,
-      products,
-      conv.isPausedAutomation
-    );
-
-    if (autoEval.shouldReply && autoEval.replyText) {
-      await metaCloudAdapter.sendTextMessage(inbound.fromPhone, autoEval.replyText);
-      storage.addMessageToConversation(conv.id, DEFAULT_BUSINESS_ID, {
-        sender: 'business',
-        text: autoEval.replyText,
-        status: 'sent',
-        isAutomated: true,
-      });
-    }
-  } catch (err) {
-    console.error('Error handling webhook event:', err);
+    await processWebhookPayload(req.body, metaCloudAdapter);
+  } catch (err: any) {
+    console.error('[Meta WhatsApp Webhook] Background processing error:', err.message);
   }
 });
 
