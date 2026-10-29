@@ -142,6 +142,7 @@ app.post('/api/customers', (req, res) => {
 
   const newCustomer = storage.createCustomer({
     ...parseResult.data,
+    phone: parseResult.data.phone,
     businessId: DEFAULT_BUSINESS_ID,
     lastInteraction: new Date().toISOString(),
     lastEnquiryDate: new Date().toISOString(),

@@ -1156,4 +1156,9 @@ class StorageEngine {
   }
 }
 
-export const storage = new StorageEngine();
+const globalForStorage = globalThis as unknown as {
+  storageInstance: StorageEngine | undefined;
+};
+
+export const storage = globalForStorage.storageInstance ?? new StorageEngine();
+if (process.env.NODE_ENV !== 'production') globalForStorage.storageInstance = storage;

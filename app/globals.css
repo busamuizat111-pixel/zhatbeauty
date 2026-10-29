@@ -1,0 +1,48 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --brand-primary: #4A2E2B;
+    --brand-primary-dark: #3B2321;
+    --brand-accent: #C86D51;
+    --brand-warm-beige: #F5EFEB;
+    --brand-surface: #FAF7F2;
+    --brand-card: #FFFFFF;
+    --brand-border: #E8DFD8;
+    --brand-charcoal: #261C1A;
+  }
+
+  body {
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    background-color: #FAF7F2;
+    color: #261C1A;
+    overflow-x: hidden;
+  }
+
+  .font-serif {
+    font-family: 'Cormorant Garamond', Garamond, Georgia, serif;
+  }
+
+  /* Subtle crochet stitch background texture overlay */
+  .crochet-knit-texture {
+    background-image: radial-gradient(#d3c2b4 0.75px, transparent 0.75px), radial-gradient(#d3c2b4 0.75px, #FAF7F2 0.75px);
+    background-size: 24px 24px;
+    background-position: 0 0, 12px 12px;
+  }
+}
+
+/* Custom scrollbar for message inbox and conversation log */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #CBD5E1;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94A3B8;
+}

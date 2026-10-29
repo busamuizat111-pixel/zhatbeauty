@@ -267,3 +267,14 @@ export class MetaCloudAdapter implements IMessagingAdapter {
     };
   }
 }
+
+declare global {
+  // eslint-disable-next-line no-var
+  var metaCloudAdapterInstance: MetaCloudAdapter | undefined;
+}
+
+export const metaCloudAdapter = globalThis.metaCloudAdapterInstance || new MetaCloudAdapter();
+if (process.env.NODE_ENV !== 'production') {
+  globalThis.metaCloudAdapterInstance = metaCloudAdapter;
+}
+
