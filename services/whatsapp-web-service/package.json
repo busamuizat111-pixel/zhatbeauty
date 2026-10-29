@@ -1,0 +1,14 @@
+{
+  "name": "kasuwadesk-whatsapp-web-service",
+  "version": "1.0.0",
+  "description": "Persistent Node.js microservice running whatsapp-web.js with Puppeteer and LocalAuth for KasuwaDesk",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "qrcode": "^1.5.4",
+    "whatsapp-web.js": "^1.26.0"
+  }
+}

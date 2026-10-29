@@ -1,0 +1,6 @@
+{
+  "name": "KasuwaDesk - WhatsApp Sales Management for Nigerian Businesses",
+  "description": "All-in-one WhatsApp CRM, product catalogue, follow-ups, inventory, and order fulfillment system for Nigerian merchants.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
